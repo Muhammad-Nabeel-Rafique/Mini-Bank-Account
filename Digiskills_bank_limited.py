@@ -3,6 +3,160 @@ import re
 from datetime import datetime
 
 
+def _encrypt_security_image(image_data, password):
+    """Encrypts an image using a key derived from the account password."""
+    import base64
+
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    salt = os.urandom(16)
+    key = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=600000,
+    ).derive(password.encode("utf-8"))
+    token = Fernet(base64.urlsafe_b64encode(key)).encrypt(image_data)
+    return salt + token
+
+
+def _decrypt_security_image(encrypted_data, password):
+    """Decrypts an image previously encrypted with the same account password."""
+    import base64
+
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    salt = encrypted_data[:16]
+    if len(salt) != 16 or len(encrypted_data) <= 16:
+        raise ValueError("Security image data is incomplete.")
+
+    key = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=600000,
+    ).derive(password.encode("utf-8"))
+    return Fernet(base64.urlsafe_b64encode(key)).decrypt(encrypted_data[16:])
+
+
+def _save_security_image(account, image_data, storage_root="security_alerts"):
+    """Saves an encrypted security image for an account."""
+    account_folder = os.path.join(storage_root, account.account_number)
+    os.makedirs(account_folder, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"failed_login_{timestamp}.enc"
+    filepath = os.path.join(account_folder, filename)
+
+    with open(filepath, "xb") as file:
+        file.write(_encrypt_security_image(image_data, account.password))
+    return filepath
+
+
+def capture_security_image(account):
+    """Captures and encrypts one webcam image after a failed login."""
+    try:
+        import cv2
+    except ImportError:
+        print(
+            "\n Security image unavailable: OpenCV is missing. "
+            "Install dependencies with 'python -m pip install -r requirements.txt'."
+        )
+        return
+
+    camera = None
+    try:
+        camera = cv2.VideoCapture(0)
+        if not camera.isOpened():
+            print("\n Security image unavailable: no accessible camera was found.")
+            return
+
+        captured, frame = camera.read()
+        if not captured:
+            print("\n Security image unavailable: the camera could not capture an image.")
+            return
+
+        encoded, image_data = cv2.imencode(".png", frame)
+        if not encoded:
+            print("\n Security image unavailable: the captured image could not be encoded.")
+            return
+
+        filepath = _save_security_image(account, image_data.tobytes())
+        print(f"\n Encrypted security image saved to: {filepath}")
+    except ImportError:
+        print(
+            "\n Security image unavailable: the cryptography package is missing. "
+            "Install dependencies with 'python -m pip install -r requirements.txt'."
+        )
+    except (OSError, cv2.error) as error:
+        print(f"\n Security image could not be saved: {error}")
+    finally:
+        if camera is not None:
+            camera.release()
+
+
+def view_security_images(account):
+    """Displays decrypted security images for an authenticated account."""
+    try:
+        import cv2
+        import numpy as np
+        from cryptography.fernet import InvalidToken
+    except ImportError:
+        print(
+            "\n Security images unavailable: required packages are missing. "
+            "Install dependencies with 'python -m pip install -r requirements.txt'."
+        )
+        return
+
+    account_folder = os.path.join("security_alerts", account.account_number)
+    try:
+        filenames = sorted(
+            filename
+            for filename in os.listdir(account_folder)
+            if filename.endswith(".enc")
+        )
+    except FileNotFoundError:
+        filenames = []
+    except OSError as error:
+        print(f"\n Security images could not be opened: {error}")
+        return
+
+    if not filenames:
+        print("\n No security images have been saved for this account.")
+        return
+
+    print("\n Security images are decrypted only for display. Press any key to continue.")
+    try:
+        for filename in filenames:
+            filepath = os.path.join(account_folder, filename)
+            try:
+                with open(filepath, "rb") as file:
+                    image_data = _decrypt_security_image(
+                        file.read(), account.password
+                    )
+                image = cv2.imdecode(
+                    np.frombuffer(image_data, dtype=np.uint8), cv2.IMREAD_COLOR
+                )
+                if image is None:
+                    print(f" Could not decode security image: {filename}")
+                    continue
+                cv2.imshow("Failed Login Security Image", image)
+                if cv2.waitKey(0) == 27:
+                    break
+            except InvalidToken:
+                print(f" Could not decrypt security image: {filename}")
+            except (OSError, ValueError, cv2.error) as error:
+                print(f" Could not display security image '{filename}': {error}")
+    finally:
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error as error:
+            print(f"\n Security image window could not be closed: {error}")
+
+
 class Customer:
     """Class to store customer details."""
 
@@ -157,8 +311,9 @@ def logged_in_menu(account):
         print("2. Withdraw Money")
         print("3. Check Balance")
         print("4. Logout")
+        print("5. View Security Images")
 
-        choice = input("Enter your choice (1-4): ").strip()
+        choice = input("Enter your choice (1-5): ").strip()
 
         if choice == "1":
             amount = get_positive_float("Enter deposit amount ($): ")
@@ -174,14 +329,22 @@ def logged_in_menu(account):
         elif choice == "4":
             print(f"\nLogged out successfully from account {account.account_number}.")
             break
+        elif choice == "5":
+            view_security_images(account)
         else:
-            print(" Error: Invalid option! Select 1 to 4.")
+            print(" Error: Invalid option! Select 1 to 5.")
 
 
 def main():
     """Main system menu for Digiskills Bank Limited."""
     accounts = {}
     acc_counter = 1001
+
+    print(
+        "\nPrivacy notice: a failed password attempt will try to capture one image "
+        "using the available webcam. Captures are encrypted with the account password "
+        "and can be viewed after a successful login."
+    )
 
     while True:
         print("\n=== DIGISKILLS BANK LIMITED ===")
@@ -240,6 +403,8 @@ def main():
                 logged_in_menu(target_account)
             else:
                 print("\n Error: Authentication Failed! Incorrect password.")
+                print("Attempting to capture an encrypted security image.")
+                capture_security_image(target_account)
 
         elif choice == "3":
             print(
